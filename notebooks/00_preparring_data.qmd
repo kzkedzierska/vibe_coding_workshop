@@ -1,0 +1,287 @@
+---
+title: "Prepare the data for the workshop"
+format: html
+---
+
+For this excercise I donwloaded the data from https://www.nature.com/articles/s41586-024-08430-9 but since I will be modyfing this data to subset and introduce some errors I rename the sequences to anonymize them (not to distract).
+
+```{r}
+library(tidyverse)
+library(here)
+data_dir = here("data")
+library(ComplexHeatmap) 
+
+# HepG2 ENCFF009HVM
+# K562 ENCFF068BWG
+# WTC11 ENCFF357GSY
+
+
+
+big_df <-
+  list.files(path = data_dir, pattern = "ENCFF", full.names = TRUE) %>% 
+  lapply(function(fpath) {
+    read_tsv(fpath) 
+  }) %>% 
+  bind_rows() 
+slice_sample(big_df, n=6)
+```
+
+```{r}
+# set seed for reproducibility
+set.seed(42)
+map_name_to_og_name_df <-
+  big_df %>% 
+  select(name) %>% 
+  unique() %>% 
+  mutate(og_name = name, 
+         name = ids::adjective_animal(n = n(), n_adjectives=2, max_len = c(8,7))) 
+
+# check that there are no duplicates
+stopifnot(n_distinct(map_name_to_og_name_df$name) == nrow(map_name_to_og_name_df))
+
+# change names in big_df
+big_df <-
+  big_df %>%
+  rename(og_name = name) %>%
+  left_join(map_name_to_og_name_df, by = "og_name") %>% 
+  select(-og_name)
+```
+
+
+
+```{r}
+slice_sample(big_df, n=1000) %>% 
+  ggplot(aes(x = n_obs_bc, y = log2)) +
+  geom_point() +
+  facet_wrap(~ condition)
+```
+
+
+
+
+```{r}
+filtered_big_df <-
+  big_df %>% 
+  filter(n_obs_bc > 10) %>% 
+  group_by(name, condition) %>% 
+  filter(n_distinct(replicate) == 3) %>% 
+  group_by(name) %>% 
+  filter(n_distinct(condition) == 3) %>% 
+  ungroup()
+  
+```
+
+```{r}
+wide_df <-
+  filtered_big_df %>% 
+  select(name, condition, replicate, ratio) %>% 
+  unite("con_rep", condition, replicate) %>% 
+  pivot_wider(names_from = con_rep, values_from = ratio) 
+```
+
+
+```{r}
+name_category_df <-
+  filtered_big_df %>% 
+  group_by(name, condition) %>% 
+  mutate(spread_ratio = max(ratio) - min(ratio),
+         mean_ratio = mean(ratio)) %>%
+  group_by(name) %>% 
+  mutate(spread_across_conditions = max(mean_ratio) - min(mean_ratio)) %>% 
+  ungroup() %>% 
+  select(name, spread_ratio, mean_ratio, spread_across_conditions) %>% 
+  group_by(name) %>% 
+  summarize(
+    max_spread_ratio = max(spread_ratio),
+    min_spread_ratio = min(spread_ratio),
+    mean_ratio = mean(mean_ratio),
+    spread_across_conditions = unique(spread_across_conditions), 
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    cat_condition = case_when(
+      spread_across_conditions > quantile(spread_across_conditions, 0.95) ~ "highly_specific",
+      spread_across_conditions < quantile(spread_across_conditions, 0.2) ~ "stable",
+      TRUE ~ "moderately_specific"
+    ),
+    cat_replicates = case_when(
+      max_spread_ratio > quantile(max_spread_ratio, 0.95) ~ "highly_variable",
+      max_spread_ratio < quantile(max_spread_ratio, 0.2) ~ "stable",
+      TRUE ~ "moderately_variable"
+    ),
+    overall_signal = case_when(
+      mean_ratio > quantile(mean_ratio, 0.90) ~ "high_expression",
+      mean_ratio < quantile(mean_ratio, 0.15) ~ "low_expression",
+      TRUE ~ "moderate_expression"
+    )
+  ) %>% 
+  select(name, cat_condition, cat_replicates, overall_signal) %>%
+  unique()
+```
+
+
+```{r}
+set.seed(123)
+splits_df <-
+  tribble(
+    ~cat_condition,          ~cat_replicates,      ~overall_signal,        ~n,
+    # High specificity patterns (condition-specific)
+    "highly_specific",       "stable",             "high_expression",      8,
+    "highly_specific",       "stable",             "moderate_expression",  8,
+    "highly_specific",       "stable",             "low_expression",       4,
+    "highly_specific",       "moderately_variable","high_expression",      5,
+    "highly_specific",       "moderately_variable","moderate_expression",  5,
+    "highly_specific",       "highly_variable",    "moderate_expression",  3,
+    
+    # Moderately specific patterns
+    "moderately_specific",   "stable",             "high_expression",      6,
+    "moderately_specific",   "stable",             "moderate_expression",  6,
+    "moderately_specific",   "moderately_variable","high_expression",      5,
+    "moderately_specific",   "moderately_variable","moderate_expression",  5,
+    "moderately_specific",   "moderately_variable","low_expression",       3,
+    
+    # Stable patterns (similar across conditions)
+    "stable",                "stable",             "high_expression",      5,
+    "stable",                "stable",             "moderate_expression",  6,
+    "stable",                "stable",             "low_expression",       4,
+    "stable",                "moderately_variable","moderate_expression",  3
+  ) %>%
+  group_by(cat_condition, cat_replicates, overall_signal) %>%
+  summarize(n = sum(n), .groups = "drop") 
+
+workshop_subset_names <- 
+  splits_df %>%
+  pmap(function(cat_condition, cat_replicates, overall_signal, n) {
+    name_category_df %>%
+      filter(cat_condition == .env$cat_condition,
+             cat_replicates == .env$cat_replicates,
+             overall_signal == .env$overall_signal) %>%
+      slice_sample(n = min(nrow(.), n)) %>%
+      pull(name)
+  }) %>%
+  unlist()
+
+# Check what you actually got
+name_category_df %>%
+  filter(name %in% workshop_subset_names) %>%
+  count(cat_condition, cat_replicates, overall_signal) %>%
+  arrange(cat_condition, overall_signal, cat_replicates)
+```
+
+
+```{r}
+#| fig.width: 5
+#| fig.height: 15
+wide_df %>% 
+  filter(name %in% workshop_subset_names) %>%
+  column_to_rownames("name") %>%  
+  as.matrix() %>%
+  # log2() %>% 
+  # scale() %>% 
+  Heatmap(heatmap_legend_param = list(direction = "horizontal")) %>% 
+  draw(heatmap_legend_side = "bottom")
+
+```
+
+```{r}
+workshop_og_subset_df <- 
+  filtered_big_df %>%
+  filter(name %in% workshop_subset_names) %>% 
+  rename(sequence_name = name, cell_line = condition, rna_dna_ratio = ratio)
+  
+```
+
+
+```{r}
+workshop_og_subset_df %>% 
+  left_join(name_category_df, by = c("sequence_name" = "name"))  %>% 
+  arrange(cat_condition, cat_replicates, overall_signal) %>% 
+  # group_by(sequence_name) %>% 
+  # filter(all(mean_ratio > 1 )) %>% 
+  select(sequence_name, cat_condition, cat_replicates, overall_signal) %>% 
+  unique() 
+```
+
+```{r}
+keep <- c("sylphic_jazzy_redhead", 
+          "newborn_topazine_wasp",
+          "allied_antique_cooter",
+          "milky_heavy_cougar")
+
+
+```
+
+```{r}
+#| fig.width: 10
+#| fig.height: 4
+workshop_og_subset_df %>% 
+  filter(sequence_name %in% keep) %>%
+  ggplot(aes(x = cell_line, y = log2(rna_dna_ratio))) +
+  facet_wrap(~sequence_name, ncol = 4) +
+  
+  # Add subtle horizontal line at y=0 for reference
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70", linewidth = 0.3) +
+  
+  # Individual data points with better visibility
+  geom_jitter(width = 0.2, height = 0, alpha = 0.5, size = 2, color = "gray30") +
+  
+  # Mean with error bars (SE)
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               color = "#D32F2F", width = 0.3, linewidth = 0.8) +
+  stat_summary(fun = mean, geom = "point", 
+               color = "#D32F2F", size = 3, shape = 18) +
+  
+  # # Connect means across cell lines to show trends
+  # stat_summary(fun = mean, geom = "line", 
+  #              aes(group = 1), color = "#D32F2F", linewidth = 0.8) +
+  # 
+  # Clean, publication-ready theme
+  theme_bw(base_size = 11) +
+  theme(
+    # Panel styling
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.5),
+    
+    # Strip (facet label) styling
+    strip.background = element_rect(fill = "gray90", color = "black", linewidth = 0.5),
+    strip.text = element_text(face = "bold", size = 9),
+    
+    # Axis styling
+    # axis.text.x = element_text(angle = 0, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(face = "bold", size = 11),
+    
+    # Legend
+    legend.position = "none",
+    axis.title.x = element_blank()
+  ) +
+  
+  # Clear axis labels
+  labs(
+    y = expression(bold(log[2]*" (RNA/DNA Ratio)")),
+    title = "Activity of selected sequences across cell lines"
+  )
+```
+
+
+
+```{r}
+workshop_mod_subset_df <-
+  workshop_og_subset_df %>% 
+    mutate(rna_dna_ratio = case_when(
+    sequence_name == "gemstone_whitish_moose" & cell_line == "K562" & replicate == 2 ~ rna_dna_ratio * 40,
+    sequence_name == "wired_cork_doe" & cell_line == "HepG2" & replicate == 1 ~ -rna_dna_ratio,
+    TRUE ~ rna_dna_ratio
+  ))
+
+write_csv(
+  workshop_mod_subset_df,
+  file = here("data", "ready_data", "mpra_results.csv")
+)
+
+write_csv(
+  workshop_mod_subset_df %>% filter(sequence_name %in% keep),
+  file = here("data", "ready_data", "mpra_results_for_plotting.csv")
+)
+```
